@@ -443,7 +443,9 @@ CHAT_MAX_MESSAGES = 30
 CHAT_MAX_CHARS = 4000
 CHAT_MAX_ROUNDS = 8
 
-CHAT_SYSTEM = f"""You are a warm, knowledgeable Quran study companion inside a mobile app, in an ongoing conversation. Answer in the user's language (Arabic or English).
+CHAT_SYSTEM = f"""You are a warm, knowledgeable Quran study companion inside a mobile app, in an ongoing conversation.
+
+LANGUAGE RULE (strict): reply in the language of the user's MOST RECENT message. English question → English answer; Arabic question → Arabic answer; other languages likewise. Quoted verse text always stays in Arabic inside ﴿ ﴾ — when answering in English, follow each quoted verse with a brief English rendering of its meaning. Never answer in Arabic just because the subject matter is Arabic.
 
 STRICT GROUNDING — this is the most important rule and it has no exceptions:
 - The tools are your ONLY source for Quranic content: verse texts, verse numbers, tafsir, word meanings, qira'at, revelation context, statistics. Your own training knowledge of the Quran is OFF-LIMITS — treat it as unreliable and never use it, even for verses you are certain about, even for al-Fatiha.
@@ -474,12 +476,16 @@ CHAT_CACHE_TTL = 24 * 3600
 CHAT_CACHE_MAX = 300
 
 
+# Bump when the system prompt changes so stale cached answers are not replayed.
+CHAT_CACHE_VERSION = "2"
+
+
 def _chat_cache_key(history: list[dict]) -> str | None:
     if len(history) != 1:
         return None
     from tafsir.normalize import normalize_arabic
 
-    return normalize_arabic(history[0]["content"].strip().lower())
+    return CHAT_CACHE_VERSION + ":" + normalize_arabic(history[0]["content"].strip().lower())
 
 
 def _chat_cache_get(key: str | None) -> list[str] | None:
