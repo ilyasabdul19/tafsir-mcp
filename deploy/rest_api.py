@@ -167,8 +167,10 @@ SUBMIT_TOOL = {
             "generated_query": {
                 "type": "string",
                 "description": (
-                    "The Arabic FTS search phrase that best retrieves the "
-                    "relevant verses (the one you used with search_quran_text)."
+                    "ONE short Arabic keyword or phrase (1-3 words max) that "
+                    "literally appears in relevant verses and returned good "
+                    "results from search_quran_text. Words are AND-ed: more "
+                    "words = fewer results, so prefer a single strong word."
                 ),
             },
             "query_language": {"type": "string", "description": "BCP-47 of the user's query, e.g. ar, en"},
@@ -342,6 +344,9 @@ def _ask_response(submitted: dict, page: int = 1) -> dict:
             if key in seen:
                 ordered.append(verse)
         search["ayas"] = {str(i): v for i, v in enumerate(ordered[:PAGE_SIZE])}
+        # FTS may have matched nothing even when verses are pinned; keep the
+        # interval consistent with what is actually being returned.
+        search["interval"]["total"] = max(search["interval"]["total"], len(ordered))
 
     return {
         "success": True,
