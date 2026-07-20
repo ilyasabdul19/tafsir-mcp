@@ -3,8 +3,8 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'tafsir-mcp'
-primary_region = 'bom'
+app = 'muslim-focus-tafsir'
+primary_region = 'cdg'
 
 [build]
   dockerfile = 'deploy/Dockerfile'

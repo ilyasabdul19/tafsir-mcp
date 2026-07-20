@@ -30,4 +30,4 @@ RUN uv run python -c "from tafsir.data_loader import get_db_path; get_db_path()"
 # HF Space exposes this; matches `app_port: 7860` in the Space README frontmatter.
 EXPOSE 7860
 
-CMD ["uv", "run", "python", "deploy/server_http.py"]
+CMD ["uv", "run", "python", "deploy/server_rest.py"]
