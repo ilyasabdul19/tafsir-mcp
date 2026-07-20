@@ -24,6 +24,8 @@ import asyncio
 import json
 import math
 import os
+import time
+from collections import defaultdict, deque
 from typing import Any, Awaitable, Callable
 
 from starlette.requests import Request
@@ -70,6 +72,53 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
 
 def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse({"success": False, "error": message}, status_code=status)
+
+
+# ── Access control & rate limiting ───────────────────────────────────────────
+#
+# If APP_API_KEY is set, every /api/* route requires a matching X-App-Key
+# header. Rate limits are sliding-window, in-memory, per client IP (per
+# machine — good enough behind Fly's load balancer for this traffic level).
+
+_RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "api": (120, 60),  # general endpoints: 120 req / minute
+    "ask": (10, 60),  # LLM endpoint: 10 req / minute
+    "ask_day": (200, 86400),  # LLM endpoint: 200 req / day
+}
+_BUCKETS: dict[tuple[str, str], deque] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    return (
+        request.headers.get("fly-client-ip")
+        or (request.client.host if request.client else "unknown")
+    )
+
+
+def _rate_limited(request: Request, *buckets: str) -> JSONResponse | None:
+    ip = _client_ip(request)
+    now = time.monotonic()
+    for bucket in buckets:
+        max_requests, window = _RATE_LIMITS[bucket]
+        entries = _BUCKETS[(bucket, ip)]
+        while entries and now - entries[0] > window:
+            entries.popleft()
+        if len(entries) >= max_requests:
+            retry_after = int(window - (now - entries[0])) + 1
+            response = _error(429, "rate limit exceeded, slow down")
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+    for bucket in buckets:
+        _BUCKETS[(bucket, ip)].append(now)
+    return None
+
+
+def _guard(request: Request, *buckets: str) -> JSONResponse | None:
+    """App-key check + rate limit; returns an error response or None."""
+    app_key = os.getenv("APP_API_KEY", "").strip()
+    if app_key and request.headers.get("x-app-key") != app_key:
+        return _error(401, "invalid or missing X-App-Key")
+    return _rate_limited(request, *buckets)
 
 
 def _verse_result(surah: int, ayah: int, text: str) -> dict:
@@ -368,6 +417,8 @@ def _ask_response(submitted: dict, page: int = 1) -> dict:
 def register_routes(mcp) -> None:  # noqa: C901
     @mcp.custom_route("/api/tools", methods=["GET"])
     async def list_tools(request: Request) -> JSONResponse:
+        if (denied := _guard(request, "api")) is not None:
+            return denied
         return JSONResponse(
             {
                 "success": True,
@@ -381,6 +432,8 @@ def register_routes(mcp) -> None:  # noqa: C901
 
     @mcp.custom_route("/api/tools/{name}", methods=["POST"])
     async def call_tool(request: Request) -> JSONResponse:
+        if (denied := _guard(request, "api")) is not None:
+            return denied
         name = request.path_params["name"]
         fn = TOOL_REGISTRY.get(name)
         if fn is None:
@@ -401,6 +454,8 @@ def register_routes(mcp) -> None:  # noqa: C901
 
     @mcp.custom_route("/api/search", methods=["GET"])
     async def search(request: Request) -> JSONResponse:
+        if (denied := _guard(request, "api")) is not None:
+            return denied
         query = request.query_params.get("q", "").strip()
         if not query:
             return _error(400, "missing query param: q")
@@ -415,6 +470,8 @@ def register_routes(mcp) -> None:  # noqa: C901
 
     @mcp.custom_route("/api/ayah/{surah:int}/{ayah:int}", methods=["GET"])
     async def ayah(request: Request) -> JSONResponse:
+        if (denied := _guard(request, "api")) is not None:
+            return denied
         include = [
             part
             for part in request.query_params.get("include", "").split(",")
@@ -433,6 +490,8 @@ def register_routes(mcp) -> None:  # noqa: C901
 
     @mcp.custom_route("/api/tafsir/{surah:int}/{ayah:int}", methods=["GET"])
     async def tafsir(request: Request) -> JSONResponse:
+        if (denied := _guard(request, "api")) is not None:
+            return denied
         sources = [
             s for s in request.query_params.get("sources", "saadi").split(",") if s
         ]
@@ -448,9 +507,8 @@ def register_routes(mcp) -> None:  # noqa: C901
 
     @mcp.custom_route("/api/ask", methods=["POST"])
     async def ask(request: Request) -> JSONResponse:
-        app_key = os.getenv("APP_API_KEY")
-        if app_key and request.headers.get("x-app-key") != app_key:
-            return _error(401, "invalid or missing X-App-Key")
+        if (denied := _guard(request, "api")) is not None:
+            return denied
 
         try:
             body = await request.json()
@@ -485,6 +543,8 @@ def register_routes(mcp) -> None:  # noqa: C901
             return _error(400, "message too long (max 500 chars)")
         if not os.getenv("OPENROUTER_API_KEY"):
             return _error(503, "AI search unavailable: OPENROUTER_API_KEY not configured")
+        if (denied := _rate_limited(request, "ask", "ask_day")) is not None:
+            return denied
 
         try:
             submitted = await _run_ask(message)
