@@ -29,7 +29,7 @@ from collections import defaultdict, deque
 from typing import Any, Awaitable, Callable
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from tafsir.tools.ayah import get_ayah, get_ayah_nuzool, get_ayah_tafsir
 from tafsir.tools.qeraat import compare_qeraat
@@ -366,6 +366,30 @@ async def _run_ask(message: str) -> dict:
         if submitted is not None:
             return submitted
 
+    # Round budget exhausted without submit_answer (seen with some models on
+    # broad thematic questions): salvage the last prose + searched query
+    # instead of failing the request.
+    last_text = next(
+        (
+            m["content"]
+            for m in reversed(messages)
+            if m.get("role") == "assistant" and isinstance(m.get("content"), str) and m["content"]
+        ),
+        "",
+    )
+    last_query = ""
+    for m in reversed(messages):
+        for call in m.get("tool_calls") or []:
+            if call["function"]["name"] == "search_quran_text":
+                try:
+                    last_query = json.loads(call["function"]["arguments"]).get("query", "")
+                except json.JSONDecodeError:
+                    pass
+                break
+        if last_query:
+            break
+    if last_text or last_query:
+        return {"explain": last_text, "generated_query": last_query, "query_language": ""}
     raise RuntimeError("model did not produce a final answer")
 
 
@@ -409,6 +433,109 @@ def _ask_response(submitted: dict, page: int = 1) -> dict:
         },
         "search": search,
     }
+
+
+# ── Streaming /api/chat (ChatGPT-style conversational interface) ─────────────
+
+CHAT_MAX_MESSAGES = 30
+CHAT_MAX_CHARS = 4000
+CHAT_MAX_ROUNDS = 8
+
+CHAT_SYSTEM = f"""You are a warm, knowledgeable Quran study companion inside a mobile app, in an ongoing conversation. Answer in the user's language (Arabic or English).
+
+The provided tools are your ONLY source of truth for Quranic content — verse texts, tafsir, word meanings, revelation context. Never quote or explain religious content from memory; consult the tools first, every time. If the tools have nothing relevant, say so honestly.
+
+Style:
+- Conversational and concise, like a thoughtful teacher. Prefer short answers; expand only when asked.
+- When you cite a specific verse, include an inline reference in the exact form [surah:ayah], e.g. [2:155] — the app turns these into tappable links. Quote the ayah text itself when it is central to the answer.
+- Name tafsir sources when you rely on them (e.g. "قال السعدي..."). Attribution: {ATTRIBUTION}.
+- Use plain text with occasional **bold**; no headers, no lists unless the user asks for an enumeration.
+- Never dump very long tafsir texts; summarize and offer the full text on request.
+- Politely decline questions unrelated to the Quran, Islam, or this app."""
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _chat_stream(history: list[dict]):
+    """Yield SSE events: delta (text), status (tool activity), done / error."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url=ASK_BASE_URL,
+        api_key=os.environ["OPENROUTER_API_KEY"].strip(),
+    )
+    tools = _openai_tools()[:-1]  # all 13 registry tools, minus submit_answer
+    messages: list[dict] = [{"role": "system", "content": CHAT_SYSTEM}, *history]
+
+    try:
+        for _ in range(CHAT_MAX_ROUNDS):
+            stream = await client.chat.completions.create(
+                model=ASK_MODEL,
+                max_tokens=2000,
+                tools=tools,
+                messages=messages,
+                stream=True,
+            )
+            content_parts: list[str] = []
+            calls: dict[int, dict] = {}
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                if delta.content:
+                    content_parts.append(delta.content)
+                    yield _sse({"type": "delta", "text": delta.content})
+                for tc in delta.tool_calls or []:
+                    slot = calls.setdefault(
+                        tc.index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        slot["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        slot["arguments"] += tc.function.arguments
+
+            if not calls:
+                yield _sse({"type": "done"})
+                return
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "".join(content_parts) or None,
+                    "tool_calls": [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {"name": c["name"], "arguments": c["arguments"]},
+                        }
+                        for c in calls.values()
+                    ],
+                }
+            )
+            for c in calls.values():
+                yield _sse({"type": "status", "tool": c["name"]})
+                fn = TOOL_REGISTRY.get(c["name"])
+                try:
+                    args = json.loads(c["arguments"] or "{}")
+                    out = await asyncio.to_thread(fn, **args) if fn else {"error": "unknown tool"}
+                except Exception as exc:
+                    out = {"error": str(exc)}
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": c["id"],
+                        "content": json.dumps(out, ensure_ascii=False, default=str)[:20000],
+                    }
+                )
+        yield _sse({"type": "done"})  # round budget exhausted; text so far stands
+    except Exception as exc:
+        yield _sse({"type": "error", "message": str(exc)})
 
 
 # ── Route registration ───────────────────────────────────────────────────────
@@ -503,6 +630,36 @@ def register_routes(mcp) -> None:  # noqa: C901
             return _error(400, str(exc))
         return JSONResponse(
             {"success": True, "attribution": ATTRIBUTION, "result": result}
+        )
+
+    @mcp.custom_route("/api/chat", methods=["POST"])
+    async def chat(request: Request) -> JSONResponse | StreamingResponse:
+        if (denied := _guard(request, "api")) is not None:
+            return denied
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _error(400, "invalid JSON body")
+        raw = body.get("messages")
+        if not isinstance(raw, list) or not raw:
+            return _error(400, "missing field: messages")
+        history = []
+        for m in raw[-CHAT_MAX_MESSAGES:]:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role not in ("user", "assistant") or not content:
+                return _error(400, "messages must be {role: user|assistant, content}")
+            history.append({"role": role, "content": content[:CHAT_MAX_CHARS]})
+        if history[-1]["role"] != "user":
+            return _error(400, "last message must be from the user")
+        if not os.getenv("OPENROUTER_API_KEY"):
+            return _error(503, "AI chat unavailable: OPENROUTER_API_KEY not configured")
+        if (denied := _rate_limited(request, "ask", "ask_day")) is not None:
+            return denied
+        return StreamingResponse(
+            _chat_stream(history),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     @mcp.custom_route("/api/ask", methods=["POST"])
