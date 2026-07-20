@@ -30,3 +30,4 @@ scripts/.db_sha256
 .env
 .env.*
 !.env.example
+.app-api-key
