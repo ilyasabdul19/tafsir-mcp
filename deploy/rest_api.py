@@ -455,6 +455,7 @@ STRICT GROUNDING — this is the most important rule and it has no exceptions:
 Style:
 - Conversational and concise, like a thoughtful teacher. Prefer short answers; expand only when asked.
 - When you cite a specific verse, include an inline reference in the exact form [surah:ayah], e.g. [2:155] — the app turns these into tappable links. Quote the ayah text itself when it is central to the answer.
+- When you quote verse text, wrap the exact text (copied verbatim from the tool result) in Quranic brackets: ﴿...﴾ followed by its [surah:ayah] reference. The app renders text inside ﴿ ﴾ in the Quranic font. Never put your own words inside ﴿ ﴾.
 - Name tafsir sources when you rely on them (e.g. "قال السعدي..."). Attribution: {ATTRIBUTION}.
 - Use plain text with occasional **bold**; no headers, no lists unless the user asks for an enumeration.
 - Never dump very long tafsir texts; summarize and offer the full text on request.
@@ -463,6 +464,61 @@ Style:
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+# Cache complete answers for single-question conversations (the suggestion
+# chips and other repeated first questions). Follow-ups (len > 1) are always
+# live. A cache hit costs no LLM tokens and skips the ask rate buckets.
+_CHAT_CACHE: dict[str, tuple[float, list[str]]] = {}
+CHAT_CACHE_TTL = 24 * 3600
+CHAT_CACHE_MAX = 300
+
+
+def _chat_cache_key(history: list[dict]) -> str | None:
+    if len(history) != 1:
+        return None
+    from tafsir.normalize import normalize_arabic
+
+    return normalize_arabic(history[0]["content"].strip().lower())
+
+
+def _chat_cache_get(key: str | None) -> list[str] | None:
+    if key is None:
+        return None
+    entry = _CHAT_CACHE.get(key)
+    if entry is None:
+        return None
+    timestamp, events = entry
+    if time.time() - timestamp > CHAT_CACHE_TTL:
+        del _CHAT_CACHE[key]
+        return None
+    return events
+
+
+def _chat_cache_put(key: str, events: list[str]) -> None:
+    if len(_CHAT_CACHE) >= CHAT_CACHE_MAX:
+        oldest = min(_CHAT_CACHE, key=lambda k: _CHAT_CACHE[k][0])
+        del _CHAT_CACHE[oldest]
+    _CHAT_CACHE[key] = (time.time(), events)
+
+
+async def _replay_events(events: list[str]):
+    for event in events:
+        yield event
+
+
+async def _recording_chat_stream(history: list[dict], cache_key: str | None):
+    """Run the live stream while teeing events into the cache on success."""
+    events: list[str] = []
+    ok = True
+    async for event in _chat_stream(history):
+        events.append(event)
+        if '"type": "error"' in event:
+            ok = False
+        yield event
+    has_text = any('"type": "delta"' in e for e in events)
+    if ok and has_text and cache_key is not None:
+        _chat_cache_put(cache_key, events)
 
 
 def _enrich_tool_output(name: str, out: Any) -> Any:
@@ -676,14 +732,25 @@ def register_routes(mcp) -> None:  # noqa: C901
             history.append({"role": role, "content": content[:CHAT_MAX_CHARS]})
         if history[-1]["role"] != "user":
             return _error(400, "last message must be from the user")
+
+        stream_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        cache_key = _chat_cache_key(history)
+        cached = _chat_cache_get(cache_key)
+        if cached is not None:
+            return StreamingResponse(
+                _replay_events(cached),
+                media_type="text/event-stream",
+                headers=stream_headers,
+            )
+
         if not os.getenv("OPENROUTER_API_KEY"):
             return _error(503, "AI chat unavailable: OPENROUTER_API_KEY not configured")
         if (denied := _rate_limited(request, "ask", "ask_day")) is not None:
             return denied
         return StreamingResponse(
-            _chat_stream(history),
+            _recording_chat_stream(history, cache_key),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers=stream_headers,
         )
 
     @mcp.custom_route("/api/ask", methods=["POST"])
