@@ -465,6 +465,22 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _enrich_tool_output(name: str, out: Any) -> Any:
+    """Swap undiacritized DB verse text for the vocalized Tanzil copy, so the
+    model quotes fully vocalized text in chat."""
+    if name == "fetch_ayah" and isinstance(out, dict) and out.get("text"):
+        vocalized = uthmani_text(out.get("surah"), out.get("ayah"))
+        if vocalized:
+            out["text"] = vocalized
+    elif name == "search_quran_text" and isinstance(out, list):
+        for hit in out:
+            if isinstance(hit, dict) and hit.get("text"):
+                vocalized = uthmani_text(hit.get("surah"), hit.get("ayah"))
+                if vocalized:
+                    hit["text"] = vocalized
+    return out
+
+
 async def _chat_stream(history: list[dict]):
     """Yield SSE events: delta (text), status (tool activity), done / error."""
     from openai import AsyncOpenAI
@@ -531,6 +547,7 @@ async def _chat_stream(history: list[dict]):
                 try:
                     args = json.loads(c["arguments"] or "{}")
                     out = await asyncio.to_thread(fn, **args) if fn else {"error": "unknown tool"}
+                    out = _enrich_tool_output(c["name"], out)
                 except Exception as exc:
                     out = {"error": str(exc)}
                 messages.append(
