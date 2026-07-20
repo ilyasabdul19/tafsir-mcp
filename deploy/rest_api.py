@@ -248,7 +248,9 @@ async def _run_ask(message: str) -> dict:
 
     client = AsyncOpenAI(
         base_url=ASK_BASE_URL,
-        api_key=os.environ["OPENROUTER_API_KEY"],
+        # .strip(): secrets pasted via `fly secrets set` can carry a trailing
+        # newline, which silently corrupts the Authorization header.
+        api_key=os.environ["OPENROUTER_API_KEY"].strip(),
     )
     tools = _openai_tools()
     messages: list[dict] = [
